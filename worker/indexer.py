@@ -47,6 +47,16 @@ WETH_ADDR = "0x3439153eb7af838ad19d56e1571fbd09333c2809"
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 PRICE_TTL = 600  # seconds
 
+# Auto-labeling: verified contract names from Etherscan V2 (chainid 2741)
+ETHERSCAN_KEY = os.getenv("ETHERSCAN_API_KEY", "")
+PROXY_NAMES = {
+    "ERC1967Proxy", "TransparentUpgradeableProxy", "AdminUpgradeabilityProxy",
+    "BeaconProxy", "Proxy", "UUPSProxy",
+}
+IMPL_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+AUTOLABEL_PER_SYNC = 15
+AUTOLABEL_RETRY = 86400  # re-check unverified contracts daily
+
 # ---------------------------------------------------------------- storage
 
 SCHEMA = """
@@ -348,6 +358,75 @@ def record_creations(con, rpc, creations):
                 )
 
 
+# ---------------------------------------------------------------- auto-labeling
+
+def prettify(name: str) -> str:
+    """MoodyMadnessAssets -> Moody Madness Assets (keeps V3, Router02 intact)."""
+    import re
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name).strip()
+
+
+def etherscan_name(client, address: str):
+    r = client.get(
+        "https://api.etherscan.io/v2/api",
+        params={
+            "chainid": "2741", "module": "contract", "action": "getsourcecode",
+            "address": address, "apikey": ETHERSCAN_KEY,
+        },
+    )
+    res = r.json().get("result")
+    if isinstance(res, list) and res:
+        return res[0].get("ContractName") or None
+    return None
+
+
+def auto_label(con, rpc, now: int):
+    """Label the most-used unlabeled contracts with their verified contract name.
+    Proxies are resolved through the EIP-1967 implementation slot. Unverified
+    contracts are retried daily. Curated labels.json entries always win."""
+    if not ETHERSCAN_KEY:
+        return
+    candidates = con.execute(
+        """
+        SELECT i.contract, COUNT(DISTINCT i.wallet) AS w FROM interactions i
+        LEFT JOIN labels l ON l.address = i.contract
+        WHERE i.hour >= ? AND l.address IS NULL
+        GROUP BY i.contract ORDER BY w DESC LIMIT 60
+        """,
+        (hour_bucket(now - 86400),),
+    ).fetchall()
+    done = 0
+    with httpx.Client(timeout=15) as c:
+        for addr, _w in candidates:
+            if done >= AUTOLABEL_PER_SYNC:
+                break
+            tried = meta_get(con, f"lbl_tried:{addr}")
+            if tried and now - int(tried) < AUTOLABEL_RETRY:
+                continue
+            done += 1
+            meta_set(con, f"lbl_tried:{addr}", now)
+            try:
+                name = etherscan_name(c, addr)
+                if name in PROXY_NAMES:
+                    slot = rpc.call("eth_getStorageAt", [addr, IMPL_SLOT, "latest"])
+                    impl = "0x" + slot[-40:]
+                    if int(impl, 16):
+                        name = etherscan_name(c, impl) or None
+                    else:
+                        name = None
+                if name and name not in PROXY_NAMES:
+                    con.execute(
+                        "INSERT INTO labels(address,label,category) VALUES(?,?,NULL) "
+                        "ON CONFLICT(address) DO NOTHING",
+                        (addr, prettify(name)),
+                    )
+                    print(f"[label] {addr[:10]}… -> {prettify(name)}")
+            except Exception as e:
+                print(f"[label] {addr[:10]}… failed: {e}")
+            time.sleep(0.25)
+    con.commit()
+
+
 # ---------------------------------------------------------------- aggregation + sync
 
 def window_stats(con, since: int, until: int):
@@ -530,6 +609,7 @@ def live_loop(backfill: int):
         if time.time() - last_sync > SYNC_MINUTES * 60:
             now = int(time.time())
             prune(con, now)
+            auto_label(con, rpc, now)
             pulse, fresh, hits = build_payloads(con, now)
             sync_supabase(pulse, fresh, hits)
             last_sync = time.time()

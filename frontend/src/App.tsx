@@ -58,7 +58,25 @@ export default function App() {
 
   const ranked = useMemo(() => {
     const metric = (p: PulseRow) => rank === 'volume' ? (p.vol_usd_24h ?? 0) : p.wallets_24h
-    return { rows: [...pulse].sort((a, b) => metric(b) - metric(a)), metric }
+    // only named apps make the leaderboard; raw contracts live in Fresh Deployments.
+    // apps with several contracts collapse into one row: txs/volume add up,
+    // wallets take the busiest contract (summing would double-count players)
+    const byApp = new Map<string, PulseRow>()
+    for (const p of pulse) {
+      if (!p.label) continue
+      const cur = byApp.get(p.label)
+      if (!cur) { byApp.set(p.label, { ...p }); continue }
+      if (p.wallets_24h > cur.wallets_24h) {
+        cur.wallets_24h = p.wallets_24h; cur.wallets_prev_24h = p.wallets_prev_24h
+        cur.wallets_7d = p.wallets_7d; cur.category = p.category ?? cur.category
+      }
+      cur.txs_24h += p.txs_24h; cur.txs_prev_24h += p.txs_prev_24h; cur.txs_7d += p.txs_7d
+      cur.vol_usd_24h = (cur.vol_usd_24h ?? 0) + (p.vol_usd_24h ?? 0)
+      cur.vol_usd_prev_24h = (cur.vol_usd_prev_24h ?? 0) + (p.vol_usd_prev_24h ?? 0)
+      cur.vol_usd_7d = (cur.vol_usd_7d ?? 0) + (p.vol_usd_7d ?? 0)
+    }
+    const rows = [...byApp.values()].sort((a, b) => metric(b) - metric(a))
+    return { rows, metric }
   }, [pulse, rank])
   const maxMetric = useMemo(
     () => Math.max(1, ...ranked.rows.map(ranked.metric)), [ranked])
