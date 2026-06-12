@@ -58,11 +58,20 @@ nav button:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px
 nav button.on { color: var(--ice-0); background: var(--frost); border-color: var(--frost); font-weight: 600; }
 
 .lede { color: var(--frost-dim); font-size: 13px; margin-bottom: 14px; max-width: 60ch; }
+.lede-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.rankbar { display: flex; border: 1px solid var(--ice-2); border-radius: 4px; overflow: hidden; flex-shrink: 0; }
+.rankbar button {
+  font-family: var(--mono); font-size: 12px; cursor: pointer;
+  color: var(--frost-dim); background: transparent; border: none; padding: 6px 12px;
+}
+.rankbar button:hover { color: var(--frost); }
+.rankbar button:focus-visible { outline: 2px solid var(--signal); outline-offset: -2px; }
+.rankbar button.on { color: var(--ice-0); background: var(--signal); font-weight: 700; }
 .empty { color: var(--frost-dim); padding: 40px 0; }
 
 .table { border: 1px solid var(--ice-2); border-radius: 6px; overflow: hidden; }
 .row {
-  display: grid; grid-template-columns: 34px 1.6fr 110px 120px 90px 1fr;
+  display: grid; grid-template-columns: 34px 1.5fr 100px 100px 110px 80px 1fr;
   gap: 12px; align-items: center; padding: 11px 14px;
   border-bottom: 1px solid var(--ice-1);
 }
@@ -105,8 +114,8 @@ footer a { color: var(--signal); text-decoration: none; }
 footer a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
 
 @media (max-width: 720px) {
-  .row { grid-template-columns: 28px 1.4fr 80px 90px; }
-  .row > .num:nth-child(5), .row > .grow { display: none; }
+  .row { grid-template-columns: 28px 1.4fr 80px 80px; }
+  .row > .num:nth-child(5), .row > .num:nth-child(6), .row > .grow { display: none; }
   .fresh-grid { grid-template-columns: 1.4fr 100px 90px 80px; }
   .fresh-grid > .num:last-child { display: none; }
 }

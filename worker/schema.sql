@@ -5,8 +5,15 @@ create table if not exists app_pulse (
   txs_24h int, wallets_24h int,
   txs_prev_24h int, wallets_prev_24h int,
   txs_7d int, wallets_7d int,
+  vol_usd_24h double precision default 0,
+  vol_usd_prev_24h double precision default 0,
+  vol_usd_7d double precision default 0,
   updated_at bigint
 );
+-- Upgrading an existing project? Run just these three lines:
+alter table app_pulse add column if not exists vol_usd_24h double precision default 0;
+alter table app_pulse add column if not exists vol_usd_prev_24h double precision default 0;
+alter table app_pulse add column if not exists vol_usd_7d double precision default 0;
 create table if not exists fresh_contracts (
   contract text primary key,
   first_seen_block bigint, first_seen_at bigint,

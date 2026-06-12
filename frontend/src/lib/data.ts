@@ -5,6 +5,7 @@ export type PulseRow = {
   txs_24h: number; wallets_24h: number
   txs_prev_24h: number; wallets_prev_24h: number
   txs_7d: number; wallets_7d: number; updated_at: number
+  vol_usd_24h: number | null; vol_usd_prev_24h: number | null; vol_usd_7d: number | null
 }
 export type FreshRow = {
   contract: string; first_seen_block: number; first_seen_at: number
@@ -21,21 +22,22 @@ export const isDemo = !supabase
 
 const now = Math.floor(Date.now() / 1000)
 const demoApps = [
-  ['Roach Racing Club', 'game', 4120, 38900, 1180, 11400],
-  ['Myriad Markets', 'prediction', 2890, 21300, 2640, 19800],
-  ['Gacha Galaxy', 'game', 1975, 17750, 2310, 21100],
-  ['Big Coin Flip', 'casino', 1410, 26200, 1455, 27100],
-  ['Penguin Life', 'social', 980, 6900, 610, 4100],
-  ['Top Hat', 'trading', 760, 9100, 790, 9600],
-  ['Kabu', 'nft', 540, 3100, 720, 4400],
-  ['Captain & Company', 'game', 410, 2800, 380, 2600],
+  ['Roach Racing Club', 'game', 4120, 38900, 1180, 11400, 412000],
+  ['Myriad Markets', 'prediction', 2890, 21300, 2640, 19800, 893000],
+  ['Gacha Galaxy', 'game', 1975, 17750, 2310, 21100, 151000],
+  ['Big Coin Flip', 'casino', 1410, 26200, 1455, 27100, 1240000],
+  ['Penguin Life', 'social', 980, 6900, 610, 4100, 18000],
+  ['Top Hat', 'trading', 760, 9100, 790, 9600, 640000],
+  ['Kabu', 'nft', 540, 3100, 720, 4400, 96000],
+  ['Captain & Company', 'game', 410, 2800, 380, 2600, 31000],
 ] as const
 
-export const demoPulse: PulseRow[] = demoApps.map(([label, category, w, t, pw, pt], i) => ({
+export const demoPulse: PulseRow[] = demoApps.map(([label, category, w, t, pw, pt, v], i) => ({
   contract: `0x${(i + 1).toString(16).padStart(40, 'a')}`,
   label, category,
   wallets_24h: w, txs_24h: t, wallets_prev_24h: pw, txs_prev_24h: pt,
   wallets_7d: w * 6, txs_7d: t * 6, updated_at: now - 120,
+  vol_usd_24h: v, vol_usd_prev_24h: Math.round(v * 0.8), vol_usd_7d: v * 6,
 }))
 
 export const demoFresh: FreshRow[] = [

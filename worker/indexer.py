@@ -35,6 +35,18 @@ SYNC_MINUTES = int(os.getenv("SYNC_MINUTES", "10"))
 DB_PATH = os.getenv("DB_PATH", "nexus.db")
 RPC_BATCH = 10  # blocks per batch request
 
+# Priced tokens on Abstract mainnet: address -> (symbol, decimals).
+# ERC-20 Transfer events of these tokens are converted to USD and credited
+# to the contract the user called. Native ETH value is priced via WETH.
+TOKENS = {
+    "0x3439153eb7af838ad19d56e1571fbd09333c2809": ("WETH", 18),
+    "0x9ebe3a824ca958e4b3da772d2065518f009cba62": ("PENGU", 18),
+    "0x84a71ccd554cc1b02749b35d22f684cc8ec987e1": ("USDC.e", 6),
+}
+WETH_ADDR = "0x3439153eb7af838ad19d56e1571fbd09333c2809"
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+PRICE_TTL = 600  # seconds
+
 # ---------------------------------------------------------------- storage
 
 SCHEMA = """
@@ -63,6 +75,15 @@ CREATE TABLE IF NOT EXISTS labels (
   label TEXT,
   category TEXT
 );
+
+-- USD volume that moved through each contract, per hour bucket
+CREATE TABLE IF NOT EXISTS volumes (
+  hour INTEGER NOT NULL,
+  contract TEXT NOT NULL,
+  usd REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (hour, contract)
+);
+CREATE INDEX IF NOT EXISTS ix_vol_hour ON volumes(hour);
 
 CREATE TABLE IF NOT EXISTS smart_wallets (address TEXT PRIMARY KEY, tag TEXT);
 
@@ -123,6 +144,54 @@ def load_seed_files(con):
     con.commit()
 
 
+# ---------------------------------------------------------------- pricing
+
+class Prices:
+    """USD prices from DexScreener, cached PRICE_TTL seconds. Falls back to the
+    last known price (persisted in the meta table) if the API is unreachable."""
+
+    def __init__(self, con, fixed=None):
+        self.con = con
+        self.fixed = fixed  # {addr: price} for simulate mode
+        self.cache = {}     # addr -> (price, fetched_at)
+
+    def get(self, token: str) -> float:
+        token = token.lower()
+        if self.fixed is not None:
+            return self.fixed.get(token, 0.0)
+        hit = self.cache.get(token)
+        if hit and time.time() - hit[1] < PRICE_TTL:
+            return hit[0]
+        price = self._fetch(token)
+        if price is None:
+            stale = meta_get(self.con, f"price:{token}")
+            price = float(stale) if stale else 0.0
+        else:
+            meta_set(self.con, f"price:{token}", price)
+        self.cache[token] = (price, time.time())
+        return price
+
+    def _fetch(self, token):
+        try:
+            r = httpx.get(
+                f"https://api.dexscreener.com/latest/dex/tokens/{token}", timeout=15
+            )
+            r.raise_for_status()
+            pairs = [
+                p for p in (r.json().get("pairs") or [])
+                if p.get("chainId") == "abstract"
+                and p["baseToken"]["address"].lower() == token
+                and p.get("priceUsd")
+            ]
+            if not pairs:
+                return None
+            best = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0))
+            return float(best["priceUsd"])
+        except Exception as e:
+            print(f"[price] {token[:10]}… fetch failed: {e}")
+            return None
+
+
 # ---------------------------------------------------------------- rpc
 
 class Rpc:
@@ -173,6 +242,17 @@ class Rpc:
         calls = [("eth_getTransactionReceipt", [h]) for h in tx_hashes]
         return self.batch(calls)
 
+    def get_logs(self, from_block, to_block, addresses, topic):
+        return self.call(
+            "eth_getLogs",
+            [{
+                "fromBlock": hex(from_block),
+                "toBlock": hex(to_block),
+                "address": addresses,
+                "topics": [topic],
+            }],
+        )
+
 
 # ---------------------------------------------------------------- ingestion
 
@@ -180,13 +260,24 @@ def hour_bucket(ts: int) -> int:
     return ts - (ts % 3600)
 
 
-def ingest_block(con, block, smart_set, creations_out):
+def add_volume(con, hour: int, contract: str, usd: float):
+    if usd <= 0:
+        return
+    con.execute(
+        "INSERT INTO volumes(hour,contract,usd) VALUES(?,?,?) "
+        "ON CONFLICT(hour,contract) DO UPDATE SET usd=usd+excluded.usd",
+        (hour, contract, usd),
+    )
+
+
+def ingest_block(con, block, smart_set, creations_out, prices, txmap=None):
     """Pull every tx in a block into the interactions table."""
     if block is None:
         return 0
     ts = int(block["timestamp"], 16)
     bn = int(block["number"], 16)
     hb = hour_bucket(ts)
+    eth_price = prices.get(WETH_ADDR)
     n = 0
     for tx in block.get("transactions", []):
         sender = (tx.get("from") or "").lower()
@@ -199,6 +290,11 @@ def ingest_block(con, block, smart_set, creations_out):
         # heuristic: calls with calldata are contract interactions
         if tx.get("input", "0x") in ("0x", None):
             continue
+        if txmap is not None:
+            txmap[tx["hash"]] = (hb, to)
+        wei = int(tx.get("value", "0x0"), 16)
+        if wei:
+            add_volume(con, hb, to, wei / 1e18 * eth_price)
         con.execute(
             "INSERT INTO interactions(hour,contract,wallet,tx_count) VALUES(?,?,?,1) "
             "ON CONFLICT(hour,contract,wallet) DO UPDATE SET tx_count=tx_count+1",
@@ -215,6 +311,26 @@ def ingest_block(con, block, smart_set, creations_out):
             )
         n += 1
     return n
+
+
+def ingest_token_volume(con, rpc, from_block, to_block, txmap, prices):
+    """Credit ERC-20 transfers of priced tokens to the contract the user called."""
+    if not txmap:
+        return
+    try:
+        logs = rpc.get_logs(from_block, to_block, list(TOKENS), TRANSFER_TOPIC)
+    except Exception as e:
+        print(f"[vol] getLogs {from_block}-{to_block} failed: {e}")
+        return
+    for log in logs:
+        entry = txmap.get(log.get("transactionHash"))
+        if entry is None:
+            continue
+        hb, app = entry
+        token = log["address"].lower()
+        sym, dec = TOKENS[token]
+        amount = int(log.get("data", "0x0"), 16) / 10**dec
+        add_volume(con, hb, app, amount * prices.get(token))
 
 
 def record_creations(con, rpc, creations):
@@ -247,11 +363,22 @@ def window_stats(con, since: int, until: int):
     return {r[0]: {"txs": r[1], "wallets": r[2]} for r in rows}
 
 
+def window_volume(con, since: int, until: int):
+    rows = con.execute(
+        "SELECT contract, SUM(usd) FROM volumes WHERE hour >= ? AND hour < ? GROUP BY contract",
+        (hour_bucket(since), hour_bucket(until) + 3600),
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
 def build_payloads(con, now: int):
     day = 86400
     cur = window_stats(con, now - day, now)
     prev = window_stats(con, now - 2 * day, now - day)
     week = window_stats(con, now - 7 * day, now)
+    vol_cur = window_volume(con, now - day, now)
+    vol_prev = window_volume(con, now - 2 * day, now - day)
+    vol_week = window_volume(con, now - 7 * day, now)
 
     labels = {
         r[0]: (r[1], r[2])
@@ -274,6 +401,9 @@ def build_payloads(con, now: int):
                 "wallets_prev_24h": p["wallets"],
                 "txs_7d": w["txs"],
                 "wallets_7d": w["wallets"],
+                "vol_usd_24h": round(vol_cur.get(addr, 0.0), 2),
+                "vol_usd_prev_24h": round(vol_prev.get(addr, 0.0), 2),
+                "vol_usd_7d": round(vol_week.get(addr, 0.0), 2),
                 "updated_at": now,
             }
         )
@@ -342,6 +472,17 @@ def sync_supabase(pulse, fresh, hits):
                 headers=headers,
                 json=rows,
             )
+            if r.status_code >= 300 and "PGRST204" in r.text:
+                # volume columns not added in Supabase yet — sync without them
+                slim = [{k: v for k, v in row.items() if not k.startswith("vol_")} for row in rows]
+                r = c.post(
+                    f"{SUPABASE_URL}/rest/v1/{table}?on_conflict=contract",
+                    headers=headers,
+                    json=slim,
+                )
+                if r.status_code < 300:
+                    print(f"[sync] {table}: {len(rows)} rows (volume columns missing in Supabase — run the ALTER)")
+                    continue
             if r.status_code >= 300:
                 print(f"[sync] {table} failed {r.status_code}: {r.text[:200]}")
             else:
@@ -350,10 +491,18 @@ def sync_supabase(pulse, fresh, hits):
 
 # ---------------------------------------------------------------- loops
 
+def prune(con, now: int):
+    """Keep interactions 9 days (powers 7d windows), volumes 35 days (monthly later)."""
+    con.execute("DELETE FROM interactions WHERE hour < ?", (now - 9 * 86400,))
+    con.execute("DELETE FROM volumes WHERE hour < ?", (now - 35 * 86400,))
+    con.commit()
+
+
 def live_loop(backfill: int):
     con = db_connect()
     load_seed_files(con)
     rpc = Rpc(RPC_URL)
+    prices = Prices(con)
     smart_set = {r[0] for r in con.execute("SELECT address FROM smart_wallets")}
 
     latest = rpc.latest_block()
@@ -367,9 +516,11 @@ def live_loop(backfill: int):
             todo = list(range(cursor + 1, min(cursor + 1 + RPC_BATCH, head + 1)))
             blocks = rpc.get_blocks(todo)
             creations = []
+            txmap = {}
             txs = 0
             for b in blocks:
-                txs += ingest_block(con, b, smart_set, creations)
+                txs += ingest_block(con, b, smart_set, creations, prices, txmap)
+            ingest_token_volume(con, rpc, todo[0], todo[-1], txmap, prices)
             record_creations(con, rpc, creations)
             cursor = todo[-1]
             meta_set(con, "cursor", cursor)
@@ -378,6 +529,7 @@ def live_loop(backfill: int):
 
         if time.time() - last_sync > SYNC_MINUTES * 60:
             now = int(time.time())
+            prune(con, now)
             pulse, fresh, hits = build_payloads(con, now)
             sync_supabase(pulse, fresh, hits)
             last_sync = time.time()
@@ -394,6 +546,7 @@ def simulate():
     con = db_connect()
     load_seed_files(con)
     smart_set = {r[0] for r in con.execute("SELECT address FROM smart_wallets")}
+    prices = Prices(con, fixed={WETH_ADDR: 1700.0})
 
     random.seed(42)
     apps = [f"0xapp{i:037x}" for i in range(12)]
@@ -417,6 +570,7 @@ def simulate():
                     "from": random.choice(wallets),
                     "to": app,
                     "input": "0xdeadbeef",
+                    "value": hex(random.randint(0, 5 * 10**16)),
                     "hash": f"0x{random.getrandbits(256):064x}",
                 })
             if day_off == 1 and h == 12:
@@ -424,7 +578,7 @@ def simulate():
                     txs.append({"from": w, "to": apps[11], "input": "0xcafe",
                                 "hash": f"0x{random.getrandbits(256):064x}"})
             block = {"number": hex(bn), "timestamp": hex(ts), "transactions": txs}
-            ingest_block(con, block, smart_set, [])
+            ingest_block(con, block, smart_set, [], prices)
             bn += 1
     # fresh deployment record for app 11
     con.execute(
@@ -437,7 +591,7 @@ def simulate():
     print("\n=== APP PULSE (top 5 by 24h wallets) ===")
     for p in pulse[:5]:
         d = p["wallets_24h"] - p["wallets_prev_24h"]
-        print(f"  {p['contract'][:14]}…  wallets24h={p['wallets_24h']:>4}  Δ={d:+4}  txs24h={p['txs_24h']}")
+        print(f"  {p['contract'][:14]}…  wallets24h={p['wallets_24h']:>4}  Δ={d:+4}  txs24h={p['txs_24h']}  vol24h=${p['vol_usd_24h']:,.0f}")
     print("\n=== FRESH CONTRACTS ===")
     for f in fresh[:5]:
         print(f"  {f['contract'][:14]}…  deployed={f['created_onchain']}  wallets24h={f['wallets_24h']}")

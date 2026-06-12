@@ -8,6 +8,12 @@ type Tab = 'pulse' | 'fresh' | 'signals'
 
 const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`
 const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n)
+const fmtUsd = (n: number | null) => {
+  const v = n ?? 0
+  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(1)}m`
+  if (v >= 1_000) return `$${(v / 1_000).toFixed(v >= 10_000 ? 0 : 1)}k`
+  return `$${v.toFixed(0)}`
+}
 const ago = (ts: number) => {
   const s = Math.max(1, Math.floor(Date.now() / 1000) - ts)
   if (s < 3600) return `${Math.floor(s / 60)}m ago`
@@ -28,8 +34,11 @@ function Bar({ value, max }: { value: number; max: number }) {
   )
 }
 
+type Rank = 'wallets' | 'volume'
+
 export default function App() {
   const [tab, setTab] = useState<Tab>('pulse')
+  const [rank, setRank] = useState<Rank>('wallets')
   const [pulse, setPulse] = useState<PulseRow[]>([])
   const [fresh, setFresh] = useState<FreshRow[]>([])
   const [signals, setSignals] = useState<SignalRow[]>([])
@@ -47,7 +56,12 @@ export default function App() {
     return () => { live = false; clearInterval(id) }
   }, [])
 
-  const maxWallets = useMemo(() => Math.max(1, ...pulse.map(p => p.wallets_24h)), [pulse])
+  const ranked = useMemo(() => {
+    const metric = (p: PulseRow) => rank === 'volume' ? (p.vol_usd_24h ?? 0) : p.wallets_24h
+    return { rows: [...pulse].sort((a, b) => metric(b) - metric(a)), metric }
+  }, [pulse, rank])
+  const maxMetric = useMemo(
+    () => Math.max(1, ...ranked.rows.map(ranked.metric)), [ranked])
   const tickerItems = useMemo(() => {
     const items: string[] = []
     fresh.slice(0, 6).forEach(f =>
@@ -85,23 +99,37 @@ export default function App() {
 
       {loaded && tab === 'pulse' && (
         <section>
-          <p className="lede">Every app ranked by real wallets in the last 24h. Onchain data only — votes can't touch this list.</p>
+          <div className="lede-row">
+            <p className="lede">
+              {rank === 'wallets'
+                ? 'Every app ranked by real wallets in the last 24h. Onchain data only — votes can\'t touch this list.'
+                : 'Every app ranked by USD that moved through it in the last 24h — ETH, PENGU and USDC.e flows, priced live.'}
+            </p>
+            <div className="rankbar" role="tablist" aria-label="rank by">
+              <button className={rank === 'wallets' ? 'on' : ''} onClick={() => setRank('wallets')}>wallets</button>
+              <button className={rank === 'volume' ? 'on' : ''} onClick={() => setRank('volume')}>volume</button>
+            </div>
+          </div>
           <div className="table">
             <div className="row head">
               <span>#</span><span>app</span><span className="num">wallets 24h</span>
-              <span className="num">Δ vs prev 24h</span><span className="num">txs 24h</span><span className="grow">share</span>
+              <span className="num">vol 24h</span><span className="num">Δ vs prev 24h</span>
+              <span className="num">txs 24h</span><span className="grow">share</span>
             </div>
-            {pulse.map((p, i) => (
+            {ranked.rows.map((p, i) => (
               <div className="row" key={p.contract}>
                 <span className="rank">{i + 1}</span>
                 <span className="name">
                   {p.label ?? <code>{short(p.contract)}</code>}
                   {p.category && <em>{p.category}</em>}
                 </span>
-                <span className="num strong">{fmt(p.wallets_24h)}</span>
-                <span className="num"><Delta cur={p.wallets_24h} prev={p.wallets_prev_24h} /></span>
+                <span className={`num ${rank === 'wallets' ? 'strong' : 'dim'}`}>{fmt(p.wallets_24h)}</span>
+                <span className={`num ${rank === 'volume' ? 'strong' : 'dim'}`}>{fmtUsd(p.vol_usd_24h)}</span>
+                <span className="num">{rank === 'volume'
+                  ? <Delta cur={p.vol_usd_24h ?? 0} prev={p.vol_usd_prev_24h ?? 0} />
+                  : <Delta cur={p.wallets_24h} prev={p.wallets_prev_24h} />}</span>
                 <span className="num dim">{fmt(p.txs_24h)}</span>
-                <span className="grow"><Bar value={p.wallets_24h} max={maxWallets} /></span>
+                <span className="grow"><Bar value={ranked.metric(p)} max={maxMetric} /></span>
               </div>
             ))}
           </div>
