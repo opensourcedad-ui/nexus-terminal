@@ -1,0 +1,2 @@
+# address [tag]  — seed with top badge holders / og NFT wallets, one per line
+# 0xabc... og badge
